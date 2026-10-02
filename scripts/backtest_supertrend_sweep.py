@@ -11,9 +11,11 @@ Usage (inside the hummingbot container):
 """
 import argparse
 import asyncio
+import logging
 import os
 import sys
 import time
+import traceback
 
 # Ensure repo root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -26,7 +28,28 @@ try:
 except ImportError:
     pass
 
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory  # noqa: E402
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig, HistoricalCandlesConfig  # noqa: E402
 from hummingbot.strategy_v2.backtesting.backtesting_engine_base import BacktestingEngineBase  # noqa: E402
+
+from controllers.directional_trading.supertrend_v1 import SuperTrend  # noqa: E402
+
+# pandas_ta's supertrend leaves SUPERTl_* (long band) empty in downtrends and SUPERTs_* (short band) empty in
+# uptrends. The backtesting engine drops every row containing a NaN, which wipes out all rows. The signal only
+# needs SUPERT_* and SUPERTd_*, so drop the one-sided bands before the engine sees them.
+_original_update_processed_data = SuperTrend.update_processed_data
+
+
+async def _update_processed_data_without_bands(self):
+    await _original_update_processed_data(self)
+    df = self.processed_data["features"]
+    self.processed_data["features"] = df.drop(
+        columns=[c for c in df.columns if c.startswith(("SUPERTl_", "SUPERTs_"))])
+
+
+SuperTrend.update_processed_data = _update_processed_data_without_bands
+
+logging.basicConfig(level=logging.WARNING, format="    %(name)s - %(levelname)s - %(message)s")
 
 # (label, interval, stop_loss, take_profit, time_limit_seconds, trailing_stop, percentage_threshold)
 SETTINGS = [
@@ -76,6 +99,15 @@ async def main(days: int, pairs, amount: int, leverage: int, cooldown: int, trad
     engine = BacktestingEngineBase()
     rows = []
 
+    # Sanity check: make sure candles download before running the whole grid
+    for interval in ("1m", "15m"):
+        feed = CandlesFactory.get_candle(CandlesConfig(connector="binance_perpetual", trading_pair=pairs[0],
+                                                       interval=interval, max_records=100))
+        df = await feed.get_historical_candles(HistoricalCandlesConfig(
+            connector_name="binance_perpetual", trading_pair=pairs[0], interval=interval,
+            start_time=end_ts - 6 * 3600, end_time=end_ts))
+        print(f"candle check: {pairs[0]} {interval} -> {len(df)} candles in the last 6h", flush=True)
+
     total_runs = len(pairs) * len(SETTINGS)
     run = 0
     for pair in pairs:
@@ -101,6 +133,8 @@ async def main(days: int, pairs, amount: int, leverage: int, cooldown: int, trad
                 })
             except Exception as e:
                 print(f"    failed: {e}", flush=True)
+                if run == 1:
+                    traceback.print_exc()
 
     rows.sort(key=lambda x: x["pnl"], reverse=True)
     print(f"\n{'=' * 100}")
