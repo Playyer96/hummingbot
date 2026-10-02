@@ -79,7 +79,8 @@ async def main(days: float, show_chart: bool, output_path: str | None,
                connector: str, trading_pair: str, total_amount_quote: int,
                resolution: str, start_price: float | None, end_price: float | None,
                limit_price: float | None, side: str, take_profit: float,
-               max_open_orders: int, leverage: int, grid_range: float):
+               max_open_orders: int, leverage: int, grid_range: float,
+               trade_cost: float = 0.0002):
     end_ts = int(time.time())
     start_ts = end_ts - int(days * 24 * 3600)
 
@@ -109,7 +110,7 @@ async def main(days: float, show_chart: bool, output_path: str | None,
     result = await engine.run_backtesting(
         config, start_ts, end_ts,
         backtesting_resolution=resolution,
-        trade_cost=0.0002,
+        trade_cost=trade_cost,
     )
     elapsed = time.perf_counter() - t0
 
@@ -166,11 +167,12 @@ if __name__ == "__main__":
     parser.add_argument("--leverage", type=int, default=20, help="Leverage")
     parser.add_argument("--chart", action="store_true", help="Show/save the chart")
     parser.add_argument("--output", type=str, default=None, help="Save chart to HTML file instead of showing")
+    parser.add_argument("--trade-cost", type=float, default=0.0002, help="Fee per side (e.g. 0.001 = Binance spot 0.1%%)")
     args = parser.parse_args()
 
     asyncio.run(main(
         args.days, args.chart, args.output, args.connector, args.trading_pair,
         args.amount, args.resolution, args.start_price, args.end_price,
         args.limit_price, args.side, args.take_profit, args.max_open_orders,
-        args.leverage, args.grid_range,
+        args.leverage, args.grid_range, args.trade_cost,
     ))
