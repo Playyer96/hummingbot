@@ -66,8 +66,26 @@ SKIPPED = ["arbitrage_controller (two exchanges)", "xemm_multiple_levels (two ex
            "ai_livestream (external signal feed)", "multi_grid_strike (needs hand-placed grids)"]
 
 
+# Shipped defaults that are stored as strings and only parsed when passed in explicitly
+# (pydantic does not run validators on default values).
+DEFAULT_OVERRIDES = {
+    "dman_v3": {"dca_spreads": "0.001,0.018,0.15,0.25", "dca_amounts_pct": "", "trailing_stop": "0.015,0.005"},
+    "pmm_simple": {"buy_spreads": "0.01,0.02", "sell_spreads": "0.01,0.02",
+                   "buy_amounts_pct": "", "sell_amounts_pct": ""},
+    "pmm_dynamic": {"buy_spreads": "1,2,4", "sell_spreads": "1,2,4", "buy_amounts_pct": "", "sell_amounts_pct": ""},
+    "dman_maker_v2": {"buy_spreads": "0.01,0.02", "sell_spreads": "0.01,0.02",
+                      "buy_amounts_pct": "", "sell_amounts_pct": "",
+                      "dca_spreads": "0.01,0.02,0.04,0.08", "dca_amounts": "0.1,0.2,0.4,0.8"},
+    "pmm_mister": {"buy_spreads": "0.0005", "sell_spreads": "0.0005",
+                   "buy_amounts_pct": "1", "sell_amounts_pct": "1"},
+    "pmm_v1": {"buy_spreads": "0.01", "sell_spreads": "0.01"},
+}
+# Controllers whose config has no leverage / position_mode fields
+NO_LEVERAGE = {"pmm_v1"}
+
+
 def directional_config(name: str, pair: str, amount: int):
-    return {
+    config = {
         "id": f"bt_{name}_{pair}",
         "controller_name": name,
         "controller_type": "directional_trading",
@@ -79,6 +97,8 @@ def directional_config(name: str, pair: str, amount: int):
         "leverage": 1,
         "position_mode": "ONEWAY",
     }
+    config.update(DEFAULT_OVERRIDES.get(name, {}))
+    return config
 
 
 def maker_config(name: str, controller_type: str, connector: str, pair: str, amount: int, price: float):
@@ -92,6 +112,9 @@ def maker_config(name: str, controller_type: str, connector: str, pair: str, amo
         "leverage": 1,
         "position_mode": "ONEWAY",
     }
+    if name in NO_LEVERAGE:
+        del config["leverage"], config["position_mode"]
+    config.update(DEFAULT_OVERRIDES.get(name, {}))
     if name == "pmm_dynamic":
         config.update({"candles_connector": connector, "candles_trading_pair": pair})
     if name == "pmm_v1":
@@ -101,7 +124,7 @@ def maker_config(name: str, controller_type: str, connector: str, pair: str, amo
     if name == "grid_strike":
         # BUY grid covering +/-3% around the starting price, stop 1% below the grid
         config.update({
-            "side": "BUY",
+            "side": 1,  # TradeType.BUY
             "start_price": str(round(price * 0.97, 6)),
             "end_price": str(round(price * 1.03, 6)),
             "limit_price": str(round(price * 0.97 * 0.99, 6)),
