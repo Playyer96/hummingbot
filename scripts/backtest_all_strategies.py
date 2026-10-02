@@ -13,6 +13,7 @@ the single-pair backtesting engine and are listed as skipped.
 Usage (inside the hummingbot container):
     docker exec -it hummingbot python /home/hummingbot/scripts/backtest_all_strategies.py
     docker exec -it hummingbot python /home/hummingbot/scripts/backtest_all_strategies.py --days 60 --pairs BTC-USDT
+    docker exec -it hummingbot python /home/hummingbot/scripts/backtest_all_strategies.py --workers 4
 """
 import argparse
 import asyncio
@@ -22,6 +23,7 @@ import sys
 import time
 import traceback
 import urllib.request
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Ensure repo root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -141,29 +143,18 @@ def funding_arbitrage(pair: str, start_ts: int, end_ts: int, amount: int):
             "income": funding_income, "fees": fees, "pnl": funding_income - fees}
 
 
-async def main(days: int, pairs, amount: int):
-    end_ts = int(time.time())
-    start_ts = end_ts - days * 24 * 3600
+async def run_batch(batch, start_ts: int, end_ts: int, amount: int, total: int):
+    """Run a batch of backtests in one event loop so the engine can reuse downloaded candles."""
     engine = BacktestingEngineBase()
+    prices = {}
     rows = []
     errors = []
-
-    jobs = []
-    for pair in pairs:
-        for name in DIRECTIONAL:
-            jobs.append((name, "futures", pair, "directional", FUTURES_FEE))
-        for name, controller_type in MAKERS:
-            jobs.append((name, "spot", pair, controller_type, SPOT_FEE))
-            jobs.append((name, "futures", pair, controller_type, FUTURES_FEE))
-
-    prices = {}
-    for i, (name, market, pair, controller_type, fee) in enumerate(jobs, start=1):
+    for index, (name, market, pair, controller_type, fee) in batch:
         connector = "binance_perpetual" if market == "futures" else "binance"
-        print(f"[{i}/{len(jobs)}] {name} | {market} | {pair} ...", flush=True)
+        print(f"[{index}/{total}] {name} | {market} | {pair} ...", flush=True)
         try:
             if controller_type == "directional":
                 config_data = directional_config(name, pair, amount)
-                controller_type = "directional_trading"
             else:
                 if (connector, pair) not in prices:
                     prices[(connector, pair)] = await start_price(connector, pair, start_ts)
@@ -183,8 +174,56 @@ async def main(days: int, pairs, amount: int):
                 "unrealized": unrealized,
             })
         except Exception as e:
-            print(f"    failed: {str(e)[:150]}", flush=True)
+            print(f"    failed [{index}] {name} | {market} | {pair}: {str(e)[:150]}", flush=True)
             errors.append(f"===== {name} | {market} | {pair}\n{traceback.format_exc()}")
+    return rows, errors
+
+
+def run_batch_in_process(batch, start_ts: int, end_ts: int, amount: int, total: int):
+    return asyncio.run(run_batch(batch, start_ts, end_ts, amount, total))
+
+
+def main(days: int, pairs, amount: int, workers: int, batch_size: int):
+    end_ts = int(time.time())
+    start_ts = end_ts - days * 24 * 3600
+    rows = []
+    errors = []
+
+    # Group jobs by pair and market so each batch shares the same 1m candles, then split into small batches
+    groups = {}
+    for pair in pairs:
+        for name in DIRECTIONAL:
+            groups.setdefault((pair, "futures"), []).append((name, "futures", pair, "directional", FUTURES_FEE))
+        for name, controller_type in MAKERS:
+            groups.setdefault((pair, "spot"), []).append((name, "spot", pair, controller_type, SPOT_FEE))
+            groups.setdefault((pair, "futures"), []).append((name, "futures", pair, controller_type, FUTURES_FEE))
+    jobs = [job for group in groups.values() for job in group]
+    numbered = list(enumerate(jobs, start=1))
+    batches = []
+    for group in groups.values():
+        group_numbered = [n for n in numbered if n[1] in group]
+        for i in range(0, len(group_numbered), batch_size):
+            batches.append(group_numbered[i:i + batch_size])
+
+    t0 = time.perf_counter()
+    print(f"Running {len(jobs)} backtests in {len(batches)} batches on {workers} worker(s) ...", flush=True)
+    if workers <= 1:
+        for batch in batches:
+            batch_rows, batch_errors = run_batch_in_process(batch, start_ts, end_ts, amount, len(jobs))
+            rows.extend(batch_rows)
+            errors.extend(batch_errors)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(run_batch_in_process, batch, start_ts, end_ts, amount, len(jobs))
+                       for batch in batches]
+            for future in as_completed(futures):
+                try:
+                    batch_rows, batch_errors = future.result()
+                    rows.extend(batch_rows)
+                    errors.extend(batch_errors)
+                except Exception:
+                    errors.append(f"===== worker crashed\n{traceback.format_exc()}")
+    print(f"Backtests finished in {time.perf_counter() - t0:.0f}s", flush=True)
 
     funding_rows = []
     for pair in pairs:
@@ -228,6 +267,10 @@ if __name__ == "__main__":
     parser.add_argument("--days", type=int, default=30, help="Number of days to backtest")
     parser.add_argument("--pairs", type=str, default="BTC-USDT,ETH-USDT", help="Comma-separated trading pairs")
     parser.add_argument("--amount", type=int, default=100, help="Capital per strategy in USDT")
+    parser.add_argument("--workers", type=int, default=max(1, min(6, (os.cpu_count() or 2) - 1)),
+                        help="Backtests to run in parallel (default: CPU cores - 1, max 6)")
+    parser.add_argument("--batch-size", type=int, default=3, help="Backtests per worker batch")
     args = parser.parse_args()
 
-    asyncio.run(main(args.days, [p.strip() for p in args.pairs.split(",") if p.strip()], args.amount))
+    main(args.days, [p.strip() for p in args.pairs.split(",") if p.strip()], args.amount,
+         args.workers, args.batch_size)
